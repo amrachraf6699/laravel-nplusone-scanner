@@ -19,7 +19,10 @@ jobs:
           php-version: ${{ matrix.php }}
           extensions: dom, mbstring, tokenizer, xml
           coverage: none
-      - uses: ramsey/composer-install@v3
+      # This is a Composer library supporting Laravel 12 and 13. A committed
+      # lock file would force one Laravel major across all PHP lanes, so each
+      # lane resolves the compatible dependency set independently.
+      - run: composer update --no-interaction --prefer-dist --no-progress
       - run: composer test
       - run: composer lint
       - run: composer validate --strict
