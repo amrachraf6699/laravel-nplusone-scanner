@@ -53,4 +53,41 @@ final class ProjectScannerTest extends TestCase
         self::assertNotEmpty($files);
         self::assertSame([], array_filter($files, static fn ($file) => pathinfo($file, PATHINFO_EXTENSION) !== 'php'));
     }
+
+    public function testItUsesTransitiveModelsAndRecognizesNativeIndexedLoops(): void
+    {
+        $root = dirname(__DIR__) . '/Fixtures/Project';
+        $options = new ScanOptions(['app/Http/Controllers/RemediationController.php'], ['app'], [], ['N1' => true, 'N2' => true, 'N3' => true, 'N4' => true], Severity::LOW);
+        $result = (new ProjectScanner())->scan($options, $root);
+        $findings = $result->findings;
+        self::assertSame(3, count(array_filter($findings, static fn ($finding) => $finding->line <= 22)));
+        self::assertGreaterThanOrEqual(3, count(array_filter($findings, static fn ($finding) => $finding->confidence->value === 'medium')));
+    }
+
+    public function testAggregateAttributesAreSafeButRelationshipPropertiesRemainCandidates(): void
+    {
+        $root = dirname(__DIR__) . '/Fixtures/Project';
+        $options = new ScanOptions(['app/Http/Controllers/RemediationController.php'], ['app'], [], ['N1' => true, 'N2' => true, 'N3' => true, 'N4' => true], Severity::LOW);
+        $result = (new ProjectScanner())->scan($options, $root);
+        $postsFindings = array_filter($result->findings, static fn ($finding) => $finding->relationship === 'posts');
+        self::assertNotEmpty($postsFindings);
+        self::assertSame([], array_filter($postsFindings, static fn ($finding) => $finding->line === 29));
+    }
+
+    public function testAmbiguousBareModelNamesDoNotResolve(): void
+    {
+        $index = new \Amrachraf6699\LaravelNPlusOneScanner\Analysis\SourceIndex();
+        $index->addModel(new \Amrachraf6699\LaravelNPlusOneScanner\Analysis\ModelMetadata('One\\User', null));
+        $index->addModel(new \Amrachraf6699\LaravelNPlusOneScanner\Analysis\ModelMetadata('Two\\User', null));
+        self::assertNull($index->model('User'));
+    }
+
+    public function testOverlappingMetadataPathsReuseParsedAsts(): void
+    {
+        $root = dirname(__DIR__) . '/Fixtures/Project';
+        $options = new ScanOptions(['app'], ['app', 'app/Models'], [], ['N1' => true, 'N2' => true, 'N3' => true, 'N4' => true], Severity::LOW);
+        $result = (new ProjectScanner())->scan($options, $root);
+        self::assertSame($result->filesAnalyzed, $result->cacheHits);
+        self::assertSame($result->filesParsed, $result->filesDiscovered);
+    }
 }
