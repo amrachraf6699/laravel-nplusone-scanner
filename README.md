@@ -1,6 +1,6 @@
 # Laravel N+1 Query Scanner
 
-`amrachraf6699/laravel-nplusone-scanner` is a conservative, offline static analyzer for potential Laravel N+1 query patterns. It parses PHP source with PHP-Parser and never performs HTTP requests, instantiates application models, connects to a database, or executes scanned code.
+`amrachraf6699/laravel-nplusone-scanner` v0.1.1 is a conservative, offline static analyzer for potential Laravel N+1 query patterns. It parses PHP source with PHP-Parser and never performs HTTP requests, instantiates application models, connects to a database, or executes scanned code.
 
 ## Installation
 
@@ -20,7 +20,7 @@ Exit code `0` means the scan completed without reaching `--fail-on`; `1` means t
 
 ## What it detects
 
-Version 0.1.0 detects conservative candidates for relationship properties and relationship query methods used during model iteration, proven Eloquent collection callbacks, and Laravel API Resource relationship access. Findings include severity and confidence. They are static warnings, not runtime proof of an N+1 query.
+Version 0.1.1 detects conservative candidates for relationship properties and relationship query methods used during model iteration, proven Eloquent collection callbacks, and Laravel API Resource relationship access. Findings include severity and confidence. They are static warnings, not runtime proof of an N+1 query.
 
 Recognized eager loading includes `with`, `withOnly`, `load`, and `loadMissing`. `withCount` and `withExists` are tracked as aggregate attributes and do not make a relationship property loaded.
 
