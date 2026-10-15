@@ -28,7 +28,6 @@ final class ModelMetadataResolver
         if ($node instanceof Stmt\Class_) {
             $class = $this->className($node);
             $parent = $node->extends?->toString();
-            $isModel = $this->isModel($parent);
             $relationships = [];
             $with = [];
             foreach ($node->stmts as $statement) {
@@ -42,9 +41,7 @@ final class ModelMetadataResolver
                     }
                 }
             }
-            if ($isModel) {
-                $index->addModel(new ModelMetadata($class, $parent, $relationships, $with));
-            }
+            $index->addDeclaration(new ModelMetadata($class, $parent, $relationships, $with));
             if ($this->isResource($parent)) {
                 $mapped = $resourceModels[$class] ?? $this->mixinModel($node->getDocComment()?->getText());
                 $index->addResource($class, is_string($mapped) ? ltrim($mapped, '\\') : null);
@@ -99,11 +96,6 @@ final class ModelMetadataResolver
     {
         $name = $class->namespacedName ?? $class->name;
         return $name ? ltrim($name->toString(), '\\') : '';
-    }
-
-    private function isModel(?string $parent): bool
-    {
-        return $parent && (str_ends_with($parent, '\\Model') || str_ends_with($parent, '\\User'));
     }
 
     private function isResource(?string $parent): bool

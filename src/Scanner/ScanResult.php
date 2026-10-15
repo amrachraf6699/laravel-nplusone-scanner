@@ -16,6 +16,8 @@ final readonly class ScanResult
         public int $filesFailed,
         public array $findings,
         public array $diagnostics,
+        public int $filesParsed = 0,
+        public int $cacheHits = 0,
     ) {
     }
 
@@ -33,6 +35,8 @@ final readonly class ScanResult
                 'files_discovered' => $this->filesDiscovered,
                 'files_analyzed' => $this->filesAnalyzed,
                 'files_failed' => $this->filesFailed,
+                'files_parsed' => $this->filesParsed,
+                'cache_hits' => $this->cacheHits,
                 'findings_total' => count($this->findings),
                 'findings_reported' => count($this->findings),
                 'findings_by_severity' => $bySeverity,

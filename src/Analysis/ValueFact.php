@@ -21,9 +21,9 @@ final class ValueFact
     {
         return new self('unknown');
     }
-    public static function model(?string $model, bool $iterable = false, array $loaded = []): self
+    public static function model(?string $model, bool $iterable = false, array $loaded = [], array $aggregates = []): self
     {
-        return new self('model', $model, null, $loaded, [], $iterable);
+        return new self('model', $model, null, $loaded, $aggregates, $iterable);
     }
     public static function collection(?string $model, array $loaded = [], array $aggregates = []): self
     {
@@ -33,12 +33,23 @@ final class ValueFact
     {
         return new self('builder', $model, null, $loaded, $aggregates);
     }
-    public static function relationQuery(?string $model, ?string $relationship): self
+    public static function relationQuery(?string $model, ?string $relationship, bool $iterable = false): self
     {
-        return new self('relation_query', $model, $relationship);
+        return new self('relation_query', $model, $relationship, [], [], $iterable);
     }
     public function copy(): self
     {
         return new self($this->kind, $this->model, $this->relationship, $this->loaded, $this->aggregates, $this->iterable, $this->autoloading);
+    }
+
+    public function equals(self $other): bool
+    {
+        return $this->kind === $other->kind
+            && $this->model === $other->model
+            && $this->relationship === $other->relationship
+            && $this->loaded === $other->loaded
+            && $this->aggregates === $other->aggregates
+            && $this->iterable === $other->iterable
+            && $this->autoloading === $other->autoloading;
     }
 }

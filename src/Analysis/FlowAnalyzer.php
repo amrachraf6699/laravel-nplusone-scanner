@@ -4,10 +4,7 @@ declare(strict_types=1);
 
 namespace Amrachraf6699\LaravelNPlusOneScanner\Analysis;
 
-use Amrachraf6699\LaravelNPlusOneScanner\Findings\Confidence;
-use Amrachraf6699\LaravelNPlusOneScanner\Findings\Finding;
 use Amrachraf6699\LaravelNPlusOneScanner\Findings\FindingCollector;
-use Amrachraf6699\LaravelNPlusOneScanner\Findings\Severity;
 use PhpParser\Node;
 use PhpParser\Node\Expr;
 use PhpParser\Node\Stmt;
@@ -15,6 +12,13 @@ use PhpParser\Node\Stmt;
 final class FlowAnalyzer
 {
     private const QUERY_TERMINALS = ['count', 'exists', 'first', 'get', 'sum', 'avg', 'max', 'min', 'pluck'];
+
+    private RuleEngine $ruleEngine;
+
+    public function __construct(?RuleEngine $ruleEngine = null)
+    {
+        $this->ruleEngine = $ruleEngine ?? RuleEngine::default();
+    }
 
     /** @param list<Node> $ast */
     public function analyze(array $ast, string $file, SourceIndex $index, FindingCollector $collector, array $enabledRules): void
@@ -50,8 +54,10 @@ final class FlowAnalyzer
                 $bodyState = $state->copy();
                 $model = $collection?->model;
                 if ($node->valueVar instanceof Expr\Variable && is_string($node->valueVar->name)) {
-                    $bodyState->vars[$node->valueVar->name] = ValueFact::model($model, true, $collection?->loaded ?? []);
+                    $bodyState->vars[$node->valueVar->name] = ValueFact::model($model, true, $collection?->loaded ?? [], $collection?->aggregates ?? []);
                 }
+                $bodyState->iterationContext = $model !== null ? 'loop' : 'none';
+                $bodyState->iterationConfidence = 'high';
                 $this->statements($node->stmts, $file, $index, $collector, $rules, $bodyState, $model !== null, $model, $resourceModel);
                 continue;
             }
@@ -59,27 +65,55 @@ final class FlowAnalyzer
                 $this->expression($node->cond, $state, $index, $file, $collector, $rules, $inIteration, $resourceModel);
                 $then = $state->copy();
                 $this->statements($node->stmts, $file, $index, $collector, $rules, $then, $inIteration, $iterationModel, $resourceModel);
+                $branches = [$then];
                 foreach ($node->elseifs as $elseif) {
                     $branch = $state->copy();
                     $this->statements($elseif->stmts, $file, $index, $collector, $rules, $branch, $inIteration, $iterationModel, $resourceModel);
+                    $branches[] = $branch;
                 }
                 if ($node->else) {
                     $branch = $state->copy();
                     $this->statements($node->else->stmts, $file, $index, $collector, $rules, $branch, $inIteration, $iterationModel, $resourceModel);
+                    $branches[] = $branch;
+                } else {
+                    $branches[] = $state->copy();
                 }
+                $joined = FlowState::join($branches);
+                $state->vars = $joined->vars;
                 continue;
             }
             if ($node instanceof Stmt\For_ || $node instanceof Stmt\While_ || $node instanceof Stmt\Do_) {
-                $condition = $node instanceof Stmt\For_ ? $node->cond : ($node instanceof Stmt\While_ ? $node->cond : $node->cond);
-                foreach ((array) $condition as $expr) {
-                    $this->expression($expr, $state, $index, $file, $collector, $rules, $inIteration, $resourceModel);
+                $conditions = $node instanceof Stmt\For_ ? $node->cond : [$node->cond];
+                foreach ($conditions as $expr) {
+                    if ($expr instanceof Node) {
+                        $this->expression($expr, $state, $index, $file, $collector, $rules, $inIteration, $resourceModel);
+                    }
                 }
-                $body = $node->stmts;
-                $this->statements($body, $file, $index, $collector, $rules, $state->copy(), false, null, $resourceModel);
+                if ($node instanceof Stmt\For_) {
+                    foreach (array_merge($node->init, $node->loop) as $expr) {
+                        $this->expression($expr, $state, $index, $file, $collector, $rules, $inIteration, $resourceModel);
+                    }
+                }
+                $bodyState = $state->copy();
+                if ($this->containsIndexedCollectionAccess($node->stmts, $state)) {
+                    $bodyState->iterationContext = 'loop';
+                    $bodyState->iterationConfidence = 'medium';
+                    $this->statements($node->stmts, $file, $index, $collector, $rules, $bodyState, true, null, $resourceModel);
+                } else {
+                    $this->statements($node->stmts, $file, $index, $collector, $rules, $bodyState, false, null, $resourceModel);
+                }
                 continue;
             }
             if ($node instanceof Stmt\Expression) {
                 $this->expression($node->expr, $state, $index, $file, $collector, $rules, $inIteration, $resourceModel);
+                continue;
+            }
+            if ($node instanceof Stmt\Unset_) {
+                foreach ($node->vars as $variable) {
+                    if ($variable instanceof Expr\Variable && is_string($variable->name)) {
+                        $state->vars[$variable->name] = ValueFact::unknown();
+                    }
+                }
                 continue;
             }
             $this->walkNode($node, $state, $index, $file, $collector, $rules, $inIteration, $resourceModel);
@@ -94,12 +128,22 @@ final class FlowAnalyzer
         if ($node instanceof Expr\Variable && is_string($node->name)) {
             return $state->vars[$node->name] ?? null;
         }
+        if ($node instanceof Expr\ArrayDimFetch) {
+            $collection = $this->expression($node->var, $state, $index, $file, $collector, $rules, $inIteration, $resourceModel);
+            if ($collection?->kind === 'collection' && $collection->model) {
+                return ValueFact::model($collection->model, true, $collection->loaded, $collection->aggregates);
+            }
+            return ValueFact::unknown();
+        }
         if ($node instanceof Expr\Assign && $node->var instanceof Expr\Variable && is_string($node->var->name)) {
             $fact = $this->expression($node->expr, $state, $index, $file, $collector, $rules, $inIteration, $resourceModel);
-            if ($fact) {
-                $state->vars[$node->var->name] = $fact;
-            }
+            $state->vars[$node->var->name] = $fact?->copy() ?? ValueFact::unknown();
             return $fact;
+        }
+        if ($node instanceof Expr\AssignOp && $node->var instanceof Expr\Variable && is_string($node->var->name)) {
+            $this->expression($node->expr, $state, $index, $file, $collector, $rules, $inIteration, $resourceModel);
+            $state->vars[$node->var->name] = ValueFact::unknown();
+            return $state->vars[$node->var->name];
         }
         if ($node instanceof Expr\ClassConstFetch && $node->name instanceof Node\Identifier && $node->name->toString() === 'class') {
             return ValueFact::model(ltrim($node->class->toString(), '\\'));
@@ -159,11 +203,11 @@ final class FlowAnalyzer
             if ($call->getAttribute('nplusone_query_terminal') === true) {
                 return null;
             }
-            return ValueFact::relationQuery($receiver->model, $name);
+            return ValueFact::relationQuery($receiver->model, $name, $receiver->iterable);
         }
         if ($receiver?->kind === 'relation_query' && in_array($name, self::QUERY_TERMINALS, true)) {
-            if (in_array($state->iterationRule, $rules, true) && $inIteration) {
-                $this->addQueryFinding($call, $file, $collector, $receiver, $name, false);
+            if ($inIteration && $state->iterationContext !== 'none' && $receiver->iterable) {
+                $this->emitQuery($call, $file, $index, $collector, $rules, $receiver, $name, $state);
             }
             return $name === 'get' ? ValueFact::collection($receiver->model, [], []) : ValueFact::unknown();
         }
@@ -177,10 +221,10 @@ final class FlowAnalyzer
                 return $receiver;
             }
             if (in_array($name, ['get', 'all', 'cursor', 'lazy'], true)) {
-                return ValueFact::collection($receiver->model, $receiver->loaded, []);
+                return ValueFact::collection($receiver->model, $receiver->loaded, $receiver->aggregates);
             }
             if (in_array($name, ['first', 'firstOrFail', 'sole'], true)) {
-                return ValueFact::model($receiver->model, false, $receiver->loaded);
+                return ValueFact::model($receiver->model, false, $receiver->loaded, $receiver->aggregates);
             }
             return $receiver;
         }
@@ -198,11 +242,40 @@ final class FlowAnalyzer
                 return $name === 'map' ? ValueFact::unknown() : $receiver;
             }
         }
+        if ($receiver?->kind === 'model' && in_array($name, ['loadCount', 'loadExists'], true)) {
+            if ($inIteration && $state->iterationContext !== 'none' && $receiver->iterable) {
+                foreach ($this->relationArguments($call->args) as $relation) {
+                    $this->emitEvent(new AnalysisEvent(
+                        AnalysisEvent::QUERY,
+                        $call,
+                        $file,
+                        $receiver->model,
+                        $relation,
+                        $name,
+                        $state->iterationContext,
+                        $state->iterationConfidence,
+                        'Load this aggregate once before iteration.',
+                    ), $index, $collector, $rules);
+                }
+            }
+            $receiver->aggregates = array_values(array_unique(array_merge($receiver->aggregates, $this->relationArguments($call->args))));
+            return $receiver;
+        }
         if ($receiver?->kind === 'model' && in_array($name, ['load', 'loadMissing'], true)) {
             $receiver->loaded = array_values(array_unique(array_merge($receiver->loaded, $this->relationArguments($call->args))));
-            if ($inIteration && in_array($state->iterationRule, $rules, true)) {
+            if ($inIteration && $state->iterationContext !== 'none' && $receiver->iterable) {
                 foreach ($this->relationArguments($call->args) as $relation) {
-                    $this->addLoadFinding($call, $file, $collector, $receiver, $relation);
+                    $this->emitEvent(new AnalysisEvent(
+                        AnalysisEvent::QUERY,
+                        $call,
+                        $file,
+                        $receiver->model,
+                        $relation,
+                        'load',
+                        $state->iterationContext,
+                        $state->iterationConfidence,
+                        'Load this relationship once on the collection before iteration.',
+                    ), $index, $collector, $rules);
                 }
             }
             return $receiver;
@@ -217,8 +290,18 @@ final class FlowAnalyzer
             return null;
         }
         if ($property->var instanceof Expr\Variable && $property->var->name === 'this' && $resourceModel) {
-            if ($index->relationship($resourceModel, $name) && in_array('N4', $rules, true)) {
-                $this->addFinding($property, $file, $collector, 'N4', Severity::MEDIUM, Confidence::LOW, $resourceModel, $name, 'Check that the resource collection eager loads this relationship.');
+            if ($index->relationship($resourceModel, $name)) {
+                $this->emitEvent(new AnalysisEvent(
+                    AnalysisEvent::RESOURCE,
+                    $property,
+                    $file,
+                    $resourceModel,
+                    $name,
+                    null,
+                    'resource',
+                    'low',
+                    'Check that the resource collection eager loads this relationship.',
+                ), $index, $collector, $rules);
             }
             return ValueFact::unknown();
         }
@@ -226,15 +309,27 @@ final class FlowAnalyzer
         if ($receiver?->kind !== 'model') {
             return null;
         }
+        if ($this->isAggregateAttribute($name, $receiver->aggregates)) {
+            return ValueFact::unknown();
+        }
         if (!$index->relationship($receiver->model ?? '', $name)) {
             return null;
         }
         if (!$inIteration || in_array($name, $receiver->loaded, true) || $receiver->autoloading) {
             return ValueFact::unknown();
         }
-        $rule = $resourceModel ? 'N4' : $state->iterationRule;
-        if (in_array($rule, $rules, true)) {
-            $this->addFinding($property, $file, $collector, $rule, $rule === 'N4' ? Severity::MEDIUM : Severity::HIGH, $rule === 'N4' ? Confidence::LOW : Confidence::HIGH, $receiver->model, $name, 'Consider eager loading ' . $name . ' before iterating.');
+        if ($state->iterationContext !== 'none' && $receiver->iterable) {
+            $this->emitEvent(new AnalysisEvent(
+                AnalysisEvent::PROPERTY,
+                $property,
+                $file,
+                $receiver->model,
+                $name,
+                null,
+                $state->iterationContext,
+                $state->iterationConfidence,
+                'Consider eager loading ' . $name . ' before iterating.',
+            ), $index, $collector, $rules);
         }
         return ValueFact::unknown();
     }
@@ -244,42 +339,37 @@ final class FlowAnalyzer
         $state = new FlowState();
         $parameter = $callback->params[0]->var ?? null;
         if ($parameter instanceof Expr\Variable && is_string($parameter->name)) {
-            $state->vars[$parameter->name] = ValueFact::model($collection->model, true, $collection->loaded);
+            $state->vars[$parameter->name] = ValueFact::model($collection->model, true, $collection->loaded, $collection->aggregates);
         }
         $body = $callback instanceof Expr\Closure ? $callback->stmts : [new Stmt\Expression($callback->expr)];
-        $state->iterationRule = 'N3';
+        $state->iterationContext = 'callback';
+        $state->iterationConfidence = 'high';
         $this->statements($body, $file, $index, $collector, $rules, $state, true, $collection->model, $resourceModel);
     }
 
-    private function addQueryFinding(Expr\MethodCall $call, string $file, FindingCollector $collector, ValueFact $fact, string $operation, bool $callback): void
+    private function emitQuery(Expr\MethodCall $call, string $file, SourceIndex $index, FindingCollector $collector, array $rules, ValueFact $fact, string $operation, FlowState $state): void
     {
         $suggestion = match ($operation) {
             'count' => "Consider withCount('{$fact->relationship}').",
             'exists' => "Consider withExists('{$fact->relationship}').",
             default => 'Consider batching this relationship query before iteration.',
         };
-        $this->addFinding($call, $file, $collector, $callback ? 'N3' : 'N2', Severity::HIGH, Confidence::HIGH, $fact->model, $fact->relationship, $suggestion);
+        $this->emitEvent(new AnalysisEvent(
+            AnalysisEvent::QUERY,
+            $call,
+            $file,
+            $fact->model,
+            $fact->relationship,
+            $operation,
+            $state->iterationContext,
+            $state->iterationConfidence,
+            $suggestion,
+        ), $index, $collector, $rules);
     }
 
-    private function addLoadFinding(Expr\MethodCall $call, string $file, FindingCollector $collector, ValueFact $fact, string $relation): void
+    private function emitEvent(AnalysisEvent $event, SourceIndex $index, FindingCollector $collector, array $rules): void
     {
-        $this->addFinding($call, $file, $collector, 'N2', Severity::HIGH, Confidence::HIGH, $fact->model, $relation, 'Load this relationship once on the collection before iteration.');
-    }
-
-    private function addFinding(Node $node, string $file, FindingCollector $collector, string $rule, Severity $severity, Confidence $confidence, ?string $model, ?string $relationship, string $suggestion): void
-    {
-        $offset = (int) ($node->getAttribute('startFilePos', 0));
-        $collector->add(new Finding($rule, $severity, $confidence, $file, $node->getStartLine(), 1, $this->message($rule, $relationship), $model, $relationship, $suggestion, null, $offset));
-    }
-
-    private function message(string $rule, ?string $relation): string
-    {
-        return match ($rule) {
-            'N1' => 'Potential N+1 relationship property access inside an iteration' . ($relation ? " ({$relation})." : '.'),
-            'N2' => 'Potential repeated relationship query inside an iteration' . ($relation ? " ({$relation})." : '.'),
-            'N3' => 'Potential N+1 relationship access inside a collection callback' . ($relation ? " ({$relation})." : '.'),
-            default => 'Potential resource relationship loading risk' . ($relation ? " ({$relation})." : '.'),
-        };
+        $this->ruleEngine->emit($event, $index, $rules, $collector);
     }
 
     private function walkNode(Node $node, FlowState $state, SourceIndex $index, string $file, FindingCollector $collector, array $rules, bool $inIteration, ?string $resourceModel): void
@@ -321,5 +411,41 @@ final class FlowAnalyzer
     private function className(Stmt\Class_ $class): string
     {
         return ltrim(($class->namespacedName ?? $class->name)?->toString() ?? '', '\\');
+    }
+
+    /** @param list<string> $aggregates */
+    private function isAggregateAttribute(string $name, array $aggregates): bool
+    {
+        foreach ($aggregates as $aggregate) {
+            if ($name === $aggregate . '_count' || $name === $aggregate . '_exists') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** @param list<Node> $nodes */
+    private function containsIndexedCollectionAccess(array $nodes, FlowState $state): bool
+    {
+        foreach ($nodes as $node) {
+            if (!$node instanceof Node) {
+                continue;
+            }
+            if ($node instanceof Expr\ArrayDimFetch && $node->var instanceof Expr\Variable && is_string($node->var->name)) {
+                if (($state->vars[$node->var->name] ?? null)?->kind === 'collection') {
+                    return true;
+                }
+            }
+            foreach ($node->getSubNodeNames() as $name) {
+                $child = $node->{$name};
+                if ($child instanceof Node && $this->containsIndexedCollectionAccess([$child], $state)) {
+                    return true;
+                }
+                if (is_array($child) && $this->containsIndexedCollectionAccess($child, $state)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 }
